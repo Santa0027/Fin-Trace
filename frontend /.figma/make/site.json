@@ -1,0 +1,10 @@
+{
+  "description": "Manage your personal finances effortlessly with a premium platform that tracks accounts, expenses, investments, and generates insightful reports.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

@@ -1,0 +1,7 @@
+ADD_LEDGER_ENTRY = "SELECT fintrace.add_ledger_entry(%s::uuid, %s::uuid, %s, %s, %s)"
+CANCEL_LEDGER_TRANSACTION = "SELECT fintrace.cancel_ledger_transaction(%s::uuid)"
+CREATE_LEDGER_TRANSACTION = "SELECT fintrace.create_ledger_transaction(%s, %s, %s)"
+DELETE_LEDGER_ENTRY = "SELECT fintrace.delete_ledger_entry(%s::uuid)"
+POST_LEDGER_TRANSACTION = "SELECT fintrace.post_ledger_transaction(%s::uuid)"
+REVERSE_LEDGER_TRANSACTION = "SELECT fintrace.reverse_ledger_transaction(%s::uuid, %s::uuid, %s, %s)"
+UPDATE_DRAFT_LEDGER_TRANSACTION = "SELECT fintrace.update_draft_ledger_transaction(%s::uuid, %s, %s, %s)"

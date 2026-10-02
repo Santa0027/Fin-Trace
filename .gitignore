@@ -1,0 +1,44 @@
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+.venv/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Python
+*.py[cod]
+*$py.class
+__pycache__/
+.pytest_cache/
+.coverage
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+.npm/
+
+# Django
+db.sqlite3
+db.sqlite3-journal
+
+# Temporary Scripts
+create_superuser.py
+seed_tenant.py
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+refactor.py
+split_components.py
