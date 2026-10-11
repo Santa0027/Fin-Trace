@@ -1,6 +1,6 @@
 from django.urls import path
 
-from FinTrace.apps.core.presentation import auth_views, views, health_views
+from FinTrace.apps.core.presentation import auth_views, broker_views, views, health_views
 
 app_name = "core"
 
@@ -30,6 +30,7 @@ urlpatterns = [
     path("v1/auth/csrf/", auth_views.CsrfView.as_view(), name="auth-csrf"),
     path("v1/auth/companies/", auth_views.CompaniesView.as_view(), name="auth-companies"),
     path("v1/auth/switch-tenant/", auth_views.SwitchTenantView.as_view(), name="auth-switch-tenant"),
+    path("v1/auth/change-password/", auth_views.ChangePasswordView.as_view(), name="auth-change-password"),
 
     path("v1/currencies/", views.CurrencyListView.as_view(), name="currency-list"),
     path("v1/transactions/", views.LedgerTransactionView.as_view(), name="transaction-list-create"),
@@ -43,7 +44,17 @@ urlpatterns = [
     path("v1/income/<uuid:row_id>/", views.IncomeDetailView.as_view(), name="income-detail"),
     path("v1/expenses/", views.ExpenseCreateView.as_view(), name="expense-list-create"),
     path("v1/expenses/<uuid:row_id>/", views.ExpenseDetailView.as_view(), name="expense-detail"),
-    path("v1/debts/<uuid:row_id>/repayments/", views.DebtRepaymentView.as_view(), name="debt-repayment-create"),
+    path("v1/transfers/", views.TransferView.as_view(), name="transfer-list-create"),
+    path("v1/dashboard/summary/", views.DashboardSummaryView.as_view(), name="dashboard-summary"),
+    path("v1/recurring-transactions/<uuid:row_id>/run/", views.RecurringRunView.as_view(), name="recurring-run"),
+    path("v1/activity/", views.ActivityView.as_view(), name="activity-list"),
+    path("v1/integrations/zerodha/portfolio/", broker_views.BrokerPortfolioView.as_view(), name="zerodha-portfolio"),
+    path("v1/integrations/zerodha/analytics/", broker_views.BrokerAnalyticsView.as_view(), name="zerodha-analytics"),
+    path("v1/integrations/zerodha/connect/", broker_views.BrokerConnectView.as_view(), name="zerodha-connect"),
+    path("v1/integrations/zerodha/callback/", broker_views.BrokerCallbackView.as_view(), name="zerodha-callback"),
+    path("v1/integrations/zerodha/sync/", broker_views.BrokerSyncView.as_view(), name="zerodha-sync"),
+    path("v1/integrations/zerodha/disconnect/", broker_views.BrokerDisconnectView.as_view(), name="zerodha-disconnect"),
+    path("v1/debts/<uuid:row_id>/repayments/", views.DebtRepaymentView.as_view(), name="debt-repayment-list-create"),
     path("v1/reports/<slug:report_name>/", views.ReportView.as_view(), name="report-list"),
 
     path("v1/rbac/pages/", type("RBACPagesView", (views.RBACListView,), {"collection": "pages"}).as_view(), name="rbac-pages"),
@@ -61,8 +72,8 @@ urlpatterns = [
     path("v1/income/<uuid:row_id>/tags/<uuid:tag_id>/", views.IncomeTagDetailView.as_view(), name="income-tag-detail"),
     path("v1/expenses/<uuid:row_id>/tags/", views.ExpenseTagsView.as_view(), name="expense-tags"),
     path("v1/expenses/<uuid:row_id>/tags/<uuid:tag_id>/", views.ExpenseTagDetailView.as_view(), name="expense-tag-detail"),
-    path("v1/investments/trades/", views.InvestmentTradeView.as_view(), name="investment-trade-create"),
-    path("v1/investments/dividends/", views.InvestmentDividendView.as_view(), name="investment-dividend-create"),
+    path("v1/investments/trades/", views.InvestmentTradeView.as_view(), name="investment-trade-list-create"),
+    path("v1/investments/dividends/", views.InvestmentDividendView.as_view(), name="investment-dividend-list-create"),
     path("v1/assets/<uuid:row_id>/valuations/", views.AssetValuationView.as_view(), name="asset-valuations"),
     path("v1/goals/<uuid:row_id>/contributions/", views.GoalContributionView.as_view(), name="goal-contributions"),
     path("v1/audit/", views.AuditListView.as_view(), name="audit-list"),

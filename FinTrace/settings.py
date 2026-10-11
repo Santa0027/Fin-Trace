@@ -12,24 +12,44 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 
 import os
 from pathlib import Path
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+try:
+    from dotenv import dotenv_values, load_dotenv
+
+    _env_path = BASE_DIR / ".env"
+    load_dotenv(_env_path)
+
+    # If critical database variables are empty or placeholder in environment, fallback to .env
+    if _env_path.exists():
+        _env_vals = dotenv_values(_env_path)
+        for _key in ("DATABASE_PASSWORD", "DATABASE_PORT", "DATABASE_HOST", "DATABASE_NAME", "DATABASE_USER"):
+            _val = os.environ.get(_key)
+            if (not _val or _val == "change-me") and _key in _env_vals and _env_vals[_key]:
+                os.environ[_key] = _env_vals[_key]
+except ImportError:
+    pass
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
+_INSECURE_SECRET_KEYS = {"django-insecure-dev-only-change-me", "change-me", ""}
 SECRET_KEY = os.environ.get("SECRET_KEY", "django-insecure-dev-only-change-me")
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get("DEBUG", "False").lower() in {"1", "true", "yes", "on"}
+
+if os.environ.get("ENV") == "production":
+    from django.core.exceptions import ImproperlyConfigured
+
+    if SECRET_KEY in _INSECURE_SECRET_KEYS:
+        raise ImproperlyConfigured("Set a strong SECRET_KEY before running with ENV=production.")
+    if DEBUG:
+        raise ImproperlyConfigured("DEBUG must be False when ENV=production.")
 
 ALLOWED_HOSTS = [
     host.strip()
@@ -41,11 +61,9 @@ ALLOWED_HOSTS = [
 # Application definition
 
 INSTALLED_APPS = [
-    'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
-    'django.contrib.messages',
     'django.contrib.staticfiles',
     'FinTrace.apps.core',
 ]
@@ -57,7 +75,6 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
-    'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
@@ -72,7 +89,6 @@ TEMPLATES = [
             'context_processors': [
                 'django.template.context_processors.request',
                 'django.contrib.auth.context_processors.auth',
-                'django.contrib.messages.context_processors.messages',
             ],
         },
     },
@@ -87,7 +103,7 @@ WSGI_APPLICATION = 'FinTrace.wsgi.application'
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
-        "HOST": os.environ.get("DATABASE_HOST", "localhost"),
+        "HOST": os.environ.get("DATABASE_HOST", "127.0.0.1"),
         "PORT": os.environ.get("DATABASE_PORT", "5434"),
         "NAME": os.environ.get("DATABASE_NAME", "fintrace"),
         "USER": os.environ.get("DATABASE_USER", "fintrace_app"),
@@ -99,6 +115,19 @@ DATABASES = {
 }
 
 
+# Cache
+# Failed sign-in throttling must be shared by every worker process, so anything
+# beyond a single development process uses the database cache table that
+# scripts/bootstrap_db.py creates.
+_SHARED_CACHE = os.environ.get(
+    "FINTRACE_SHARED_CACHE", "true" if os.environ.get("ENV") == "production" else "false"
+).lower() in {"1", "true", "yes", "on"}
+if _SHARED_CACHE:
+    CACHES = {"default": {"BACKEND": "django.core.cache.backends.db.DatabaseCache", "LOCATION": "django_cache"}}
+else:
+    CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
+
+
 # Password validation
 # https://docs.djangoproject.com/en/5.2/ref/settings/#auth-password-validators
 
@@ -108,6 +137,7 @@ AUTH_PASSWORD_VALIDATORS = [
     },
     {
         'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
+        'OPTIONS': {'min_length': 10},
     },
     {
         'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
@@ -140,10 +170,24 @@ STATIC_URL = 'static/'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-FINTRACE_ALLOW_HEADER_USER_ID = os.environ.get("FINTRACE_ALLOW_HEADER_USER_ID", "False").lower() in {"1", "true", "yes", "on"}
 FINTRACE_DEFAULT_PAGE_SIZE = int(os.environ.get("FINTRACE_DEFAULT_PAGE_SIZE", "50"))
 FINTRACE_MAX_PAGE_SIZE = int(os.environ.get("FINTRACE_MAX_PAGE_SIZE", "200"))
 AUTH_USER_MODEL = 'core.UserModel'
+
+# Zerodha Kite Connect (stocks and ETFs on Kite, mutual funds on Coin). Create an
+# app at https://developers.kite.trade and register its redirect URL as
+# <your site>/api/v1/integrations/zerodha/callback/ . Leave unset to disable.
+KITE_API_KEY = os.environ.get("KITE_API_KEY", "")
+KITE_API_SECRET = os.environ.get("KITE_API_SECRET", "")
+# Optional Fernet key for broker tokens at rest; derived from SECRET_KEY when unset.
+FINTRACE_TOKEN_ENCRYPTION_KEY = os.environ.get("FINTRACE_TOKEN_ENCRYPTION_KEY", "")
+# Where the browser returns to after the broker's login page (same origin by default).
+FINTRACE_FRONTEND_URL = os.environ.get("FINTRACE_FRONTEND_URL", "/")
+
+# Failed sign-in throttling (per client address + identifier). The default cache is
+# per-process; point CACHES at a shared backend when running more than one worker.
+FINTRACE_LOGIN_MAX_FAILURES = int(os.environ.get("FINTRACE_LOGIN_MAX_FAILURES", "5"))
+FINTRACE_LOGIN_LOCKOUT_SECONDS = int(os.environ.get("FINTRACE_LOGIN_LOCKOUT_SECONDS", "900"))
 
 # Production settings overrides
 import os
@@ -153,6 +197,7 @@ SESSION_COOKIE_SECURE = os.environ.get("ENV") == "production"
 CSRF_COOKIE_SECURE = os.environ.get("ENV") == "production"
 SESSION_COOKIE_SAMESITE = "Lax"
 CSRF_COOKIE_SAMESITE = "Lax"
+CSRF_FAILURE_VIEW = "FinTrace.apps.core.presentation.auth_views.csrf_failure"
 CSRF_TRUSTED_ORIGINS = os.environ.get("CSRF_TRUSTED_ORIGINS", "").split(",") if os.environ.get("CSRF_TRUSTED_ORIGINS") else []
 if os.environ.get("ENV") == "production":
     SECURE_SSL_REDIRECT = True

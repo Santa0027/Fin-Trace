@@ -71,11 +71,34 @@ class Command(BaseCommand):
             if missing[kind]:
                 self.stdout.write(f"missing_{kind}s={','.join(missing[kind])}")
 
+        cursor_checks = self._privilege_problems()
+        unsafe.extend(cursor_checks)
         if unsafe:
             raise CommandError(f"Unsafe runtime role flags/memberships: {', '.join(unsafe)}")
         if options["strict"] and any(missing.values()):
             raise CommandError("Runtime database is missing authoritative schema objects.")
         self.stdout.write(self.style.SUCCESS("Runtime database validation completed."))
+
+    def _privilege_problems(self) -> list[str]:
+        """Things the runtime role must not be able to do."""
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT has_table_privilege(current_user, 'fintrace.security_config', 'SELECT'),
+                       has_function_privilege(current_user, 'fintrace.context_signature(uuid, uuid)', 'EXECUTE'),
+                       has_table_privilege(current_user, 'fintrace.audit_events', 'UPDATE')
+                           OR has_table_privilege(current_user, 'fintrace.audit_events', 'DELETE')
+                """
+            )
+            reads_secret, signs_context, rewrites_audit = cursor.fetchone()
+        problems = []
+        if reads_secret:
+            problems.append("CAN_READ_CONTEXT_SECRET")
+        if signs_context:
+            problems.append("CAN_SIGN_CONTEXT")
+        if rewrites_audit:
+            problems.append("CAN_REWRITE_AUDIT")
+        return problems
 
     def _expected_objects(self) -> dict[str, set[str]]:
         sql = authoritative_schema_path().read_text()
@@ -86,11 +109,14 @@ class Command(BaseCommand):
         tables = {row[0] for row in cursor.fetchall()}
         cursor.execute("SELECT viewname FROM pg_views WHERE schemaname = 'fintrace'")
         views = {row[0] for row in cursor.fetchall()}
+        # pg_proc lists every routine; information_schema hides the ones this role
+        # may not execute (the context signer is deliberately one of those).
         cursor.execute(
             """
-            SELECT routine_name
-              FROM information_schema.routines
-             WHERE specific_schema = 'fintrace'
+            SELECT p.proname
+              FROM pg_proc p
+              JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = 'fintrace'
             """
         )
         routines = {row[0] for row in cursor.fetchall()}

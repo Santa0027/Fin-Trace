@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-superuser-password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_HOST: 127.0.0.1
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: fintrace_integration
+      DATABASE_USER: fintrace_app
+      DATABASE_PASSWORD: ci-runtime-password
+      FINTRACE_DB_ADMIN_USER: postgres
+      FINTRACE_DB_ADMIN_PASSWORD: ci-superuser-password
+      FINTRACE_TEST_ADMIN_USER: postgres
+      FINTRACE_TEST_ADMIN_PASSWORD: ci-superuser-password
+      SECRET_KEY: ci-only-secret-key
+      DEBUG: "False"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Build the database from scratch
+        run: python scripts/bootstrap_db.py --seed-currencies
+      - name: Bootstrap is idempotent
+        run: python scripts/bootstrap_db.py
+      - run: python manage.py check
+      - run: python manage.py validate_runtime_database --strict
+      - name: Unit tests
+        run: python -m pytest FinTrace -q
+      - name: Integration tests
+        run: python -m pytest -m integration -q
+      - name: Demo seed runs end to end (and is a no-op the second time)
+        run: |
+          python scripts/seed_demo.py
+          python scripts/seed_demo.py
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build

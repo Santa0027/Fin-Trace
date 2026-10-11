@@ -1,0 +1,8 @@
+{
+  "name": "FinTrace",
+  "description": "Personal and business multi-tenant financial tracking, ledger, and cash flow management.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

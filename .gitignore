@@ -42,3 +42,6 @@ seed_tenant.py
 *.swp
 refactor.py
 split_components.py
+
+# Originals of frontend files replaced during the API integration pass (frontend/ had no git history)
+.frontend-original-backup/

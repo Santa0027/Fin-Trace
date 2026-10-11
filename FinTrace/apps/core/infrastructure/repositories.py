@@ -151,12 +151,16 @@ class PostgreSQLFinancialMetadataRepository(FinancialMetadataRepository):
         )
 
 
+    def mark_debt_paid(self, debt_id: UUID) -> None:
+        self.db.execute("UPDATE fintrace.debts SET status = 'PAID' WHERE id = %s::uuid AND status = 'ACTIVE'", [str(debt_id)])
+
+
 class TenantResourceRepository:
     CONFIG = {
         "tenants": {
             "table": "fintrace.tenants",
             "columns": ["slug", "name", "owner_id", "base_currency_id", "status"],
-            "update": ["name", "status"],
+            "update": ["name", "timezone"],
             "order": "created_at DESC",
             "tenant_column": "id",
         },
@@ -282,6 +286,8 @@ class TenantResourceRepository:
             return
         assignments = [f"{column} = {self._placeholder(column)}" for column in columns]
         values = [payload[column] for column in columns]
+        if payload.get("is_active") is True and "archived_at" in self.config.get("archive", ""):
+            assignments.append("archived_at = NULL")  # restoring undoes the archive
         self.db.execute(f"UPDATE {self.config['table']} SET {', '.join(assignments)} WHERE id = %s::uuid", [*values, str(row_id)])
 
     def archive(self, row_id: UUID) -> None:
@@ -478,7 +484,8 @@ class AuditRepository:
         return self.db.fetch_all(f"SELECT id, actor_user_id, subject_user_id, action, before_data, after_data, request_id, database_user, occurred_at FROM fintrace.security_audit_events {sql_where} ORDER BY occurred_at DESC LIMIT %s OFFSET %s", [*params, limit, offset])
 
     def security_config_status(self) -> dict | None:
-        return self.db.fetch_one("SELECT singleton, created_at, context_hmac_secret IS NOT NULL AS has_context_hmac_secret FROM fintrace.security_config WHERE singleton = TRUE")
+        # The secret column is NOT NULL and deliberately unreadable by runtime roles.
+        return self.db.fetch_one("SELECT singleton, created_at, TRUE AS has_context_hmac_secret FROM fintrace.security_config WHERE singleton = TRUE")
 
 
 class IdempotencyRepository:
@@ -486,28 +493,46 @@ class IdempotencyRepository:
         self.db = DatabaseExecutor()
 
     def begin(self, tenant_id: UUID, user_id: UUID, scope: str, key: str, fingerprint: str, expires_at) -> dict:
-        with transaction.atomic():
-            existing = self.db.fetch_one(
-                """
-                SELECT * FROM fintrace.idempotency_operations
-                 WHERE tenant_id = %s::uuid AND operation_scope = %s AND operation_key = %s
-                 FOR UPDATE
-                """,
-                [str(tenant_id), scope, key],
-            )
-            if existing is not None:
-                existing["is_new"] = False
-                return existing
-            created = self.db.fetch_one(
-                """
-                INSERT INTO fintrace.idempotency_operations (tenant_id, user_id, operation_scope, operation_key, request_fingerprint, expires_at)
-                VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s)
-                RETURNING *
-                """,
-                [str(tenant_id), str(user_id), scope, key, fingerprint, expires_at],
-            )
+        """Claim the key, or return the row that already holds it.
+
+        The insert waits on a concurrent uncommitted claim of the same key, so a
+        duplicate request blocks until the first one commits (and then replays its
+        response) or rolls back (and then proceeds as the first attempt).
+        """
+        created = self.db.fetch_one(
+            """
+            INSERT INTO fintrace.idempotency_operations (tenant_id, user_id, operation_scope, operation_key, request_fingerprint, expires_at)
+            VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, operation_scope, operation_key) DO NOTHING
+            RETURNING *
+            """,
+            [str(tenant_id), str(user_id), scope, key, fingerprint, expires_at],
+        )
+        if created is not None:
             created["is_new"] = True
             return created
+        existing = self.db.fetch_one(
+            """
+            SELECT * FROM fintrace.idempotency_operations
+             WHERE tenant_id = %s::uuid AND operation_scope = %s AND operation_key = %s
+             FOR UPDATE
+            """,
+            [str(tenant_id), scope, key],
+        )
+        if existing is None:
+            raise RuntimeError("Idempotency key is held by an operation that is not visible to this tenant context")
+        existing["is_new"] = False
+        return existing
+
+    def restart(self, operation_id: UUID, expires_at) -> None:
+        self.db.execute(
+            """
+            UPDATE fintrace.idempotency_operations
+               SET status = 'PROCESSING', failure_reason = '', failed_at = NULL, expires_at = %s
+             WHERE id = %s::uuid
+            """,
+            [expires_at, str(operation_id)],
+        )
 
     def complete(self, operation_id: UUID, business_operation_id: UUID | None, response_status: int, response_payload: dict) -> None:
         self.db.execute(

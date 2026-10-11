@@ -210,8 +210,9 @@ def test_concurrent_duplicate_income_and_double_reversal(context, financial_acco
     with ThreadPoolExecutor(max_workers=2) as pool:
         statuses = list(pool.map(lambda _: submit_income(), range(2)))
 
-    assert statuses.count(201) == 1
-    assert any(status >= 400 for status in statuses)
+    # A concurrent duplicate waits for the first request and replays its response:
+    # both callers see success, and the ledger holds exactly one transaction.
+    assert statuses == [201, 201]
     assert _ledger_count_for_reference(context, payload["reference"]) == 1
 
     transaction_id = _json(_post_income(context, _income_payload(context, financial_accounts["cash"], financial_accounts["income"], financial_accounts["income_category"], "6.00"), f"rev-source-{uuid4()}"))["ledger_transaction_id"]

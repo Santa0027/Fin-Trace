@@ -50,6 +50,7 @@ class CreateIncomeDTO:
     contact_id: UUID | None = None
     reference: str = ""
     notes: str = ""
+    exchange_rate: Decimal = Decimal("1")
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,7 @@ class CreateExpenseDTO:
     contact_id: UUID | None = None
     reference: str = ""
     notes: str = ""
+    exchange_rate: Decimal = Decimal("1")
 
 
 @dataclass(frozen=True)
@@ -78,3 +80,7 @@ class CreateDebtRepaymentDTO:
     interest_amount: Decimal = Decimal("0")
     reference: str = ""
     notes: str = ""
+    debt_type: str = "PAYABLE"
+    interest_account_id: UUID | None = None
+    exchange_rate: Decimal = Decimal("1")
+    settles_debt: bool = False

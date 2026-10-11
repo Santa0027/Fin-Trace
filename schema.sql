@@ -5004,6 +5004,13 @@ BEGIN
        AND instrument_id = NEW.instrument_id
      FOR UPDATE;
 
+    -- SELECT INTO nulls its targets when no row matches; a first trade in an
+    -- instrument starts from an empty position, not an unknown one.
+    IF NOT FOUND THEN
+        v_quantity := 0;
+        v_average_cost := 0;
+    END IF;
+
     IF NEW.trade_type = 'BUY' THEN
         IF v_quantity = 0 THEN
             v_average_cost := round(((NEW.quantity * NEW.price) + NEW.fees) / NEW.quantity, 8);
@@ -5250,5 +5257,402 @@ END;
 $$;
 
 REVOKE ALL ON FUNCTION fintrace.update_draft_ledger_transaction(UUID, TIMESTAMPTZ, VARCHAR, TEXT) FROM PUBLIC;
+
+-- -----------------------------------------------------------------------------
+-- Workspace discovery before a tenant context exists
+-- -----------------------------------------------------------------------------
+-- tenants and tenant_memberships are only visible inside a signed tenant
+-- context, but sign-in has to learn which workspaces a user may enter before one
+-- can be set. This returns only the caller-supplied user's own ACTIVE
+-- memberships of ACTIVE tenants. With p_platform_admin it also lists the other
+-- active workspaces (name and slug only, is_member = FALSE) so a platform
+-- administrator can see they exist; fintrace.set_context() still refuses to
+-- enter any workspace without an active membership.
+CREATE OR REPLACE FUNCTION fintrace.list_user_tenants(
+    p_user_id UUID,
+    p_platform_admin BOOLEAN DEFAULT FALSE
+)
+RETURNS TABLE (
+    id UUID, slug VARCHAR, name VARCHAR, status VARCHAR, is_member BOOLEAN,
+    base_currency_id UUID, base_currency_code VARCHAR, base_currency_symbol VARCHAR, base_currency_decimals SMALLINT
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = fintrace, pg_temp
+AS $$
+    SELECT t.id, t.slug, t.name, t.status, (m.id IS NOT NULL) AS is_member,
+           c.id, c.code, c.symbol, c.decimal_places
+      FROM fintrace.tenants t
+      JOIN fintrace.currencies c ON c.id = t.base_currency_id
+      LEFT JOIN fintrace.tenant_memberships m
+             ON m.tenant_id = t.id
+            AND m.user_id = p_user_id
+            AND m.status = 'ACTIVE'
+     WHERE t.status = 'ACTIVE'
+       AND EXISTS (SELECT 1 FROM fintrace.users u WHERE u.id = p_user_id AND u.status = 'ACTIVE')
+       AND (m.id IS NOT NULL OR COALESCE(p_platform_admin, FALSE))
+     ORDER BY (m.id IS NOT NULL) DESC, t.name, t.id;
+$$;
+
+REVOKE ALL ON FUNCTION fintrace.list_user_tenants(UUID, BOOLEAN) FROM PUBLIC;
+
+-- -----------------------------------------------------------------------------
+-- Workspace timezone, and loan balances that follow ledger reversals
+-- -----------------------------------------------------------------------------
+-- Calendar days (report periods, "this month") are the workspace's local days.
+ALTER TABLE fintrace.tenants
+    ADD COLUMN IF NOT EXISTS timezone VARCHAR(64) NOT NULL DEFAULT 'UTC';
+
+CREATE OR REPLACE FUNCTION fintrace.validate_tenant_timezone()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_timezone_names WHERE name = NEW.timezone) THEN
+        RAISE EXCEPTION 'Unknown timezone %', NEW.timezone USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS tenants_timezone_validate ON fintrace.tenants;
+CREATE TRIGGER tenants_timezone_validate
+BEFORE INSERT OR UPDATE OF timezone ON fintrace.tenants
+FOR EACH ROW EXECUTE FUNCTION fintrace.validate_tenant_timezone();
+
+-- A repayment row is immutable history. When its ledger transaction is reversed,
+-- the repayment stops counting: the ledger, not a flag on the row, decides.
+CREATE OR REPLACE FUNCTION fintrace.debt_repayment_is_effective(p_tenant_id UUID, p_ledger_transaction_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT NOT EXISTS (
+        SELECT 1 FROM fintrace.ledger_transactions rev
+         WHERE rev.tenant_id = p_tenant_id
+           AND rev.reverses_transaction_id = p_ledger_transaction_id
+           AND rev.status = 'COMPLETED'
+    );
+$$;
+
+CREATE OR REPLACE VIEW fintrace.debt_balances
+WITH (security_invoker = true) AS
+SELECT
+    d.id AS debt_id,
+    d.tenant_id,
+    d.type,
+    d.contact_id,
+    d.principal_amount,
+    COALESCE(sum(r.principal_amount),0) AS repaid_principal,
+    d.principal_amount - COALESCE(sum(r.principal_amount),0) AS outstanding_principal,
+    d.currency_id,
+    d.status,
+    d.start_date,
+    d.due_date
+FROM fintrace.debts d
+LEFT JOIN fintrace.debt_repayments r
+       ON r.tenant_id = d.tenant_id AND r.debt_id = d.id
+      AND fintrace.debt_repayment_is_effective(r.tenant_id, r.ledger_transaction_id)
+WHERE d.tenant_id = fintrace.current_tenant_id()
+GROUP BY d.id, d.tenant_id, d.type, d.contact_id,
+         d.principal_amount, d.currency_id, d.status, d.start_date, d.due_date;
+
+CREATE OR REPLACE FUNCTION fintrace.validate_debt_status(p_debt_id UUID, p_tenant_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_status TEXT;
+    v_principal NUMERIC(28,8);
+    v_repaid_principal NUMERIC(38,8);
+    v_outstanding NUMERIC(38,8);
+BEGIN
+    SELECT status, principal_amount
+      INTO v_status, v_principal
+      FROM fintrace.debts
+     WHERE tenant_id = p_tenant_id AND id = p_debt_id;
+
+    IF v_principal IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT COALESCE(sum(principal_amount),0)
+      INTO v_repaid_principal
+      FROM fintrace.debt_repayments r
+     WHERE r.tenant_id = p_tenant_id AND r.debt_id = p_debt_id
+       AND fintrace.debt_repayment_is_effective(r.tenant_id, r.ledger_transaction_id);
+
+    v_outstanding := v_principal - v_repaid_principal;
+
+    IF v_outstanding < 0 THEN
+        RAISE EXCEPTION 'Debt % has repayments exceeding principal', p_debt_id
+            USING ERRCODE = '23514';
+    END IF;
+
+    IF v_status = 'PAID' AND v_outstanding <> 0 THEN
+        RAISE EXCEPTION 'Debt % cannot be PAID while principal outstanding is %', p_debt_id, v_outstanding
+            USING ERRCODE = '23514';
+    END IF;
+
+    IF v_status = 'ACTIVE' AND v_outstanding = 0 THEN
+        RAISE EXCEPTION 'Debt % should be PAID once principal outstanding reaches zero', p_debt_id
+            USING ERRCODE = '23514';
+    END IF;
+END;
+$$;
+
+-- Sign-in also needs the workspace timezone; the return type changes, so recreate.
+DROP FUNCTION IF EXISTS fintrace.list_user_tenants(UUID, BOOLEAN);
+CREATE FUNCTION fintrace.list_user_tenants(
+    p_user_id UUID,
+    p_platform_admin BOOLEAN DEFAULT FALSE
+)
+RETURNS TABLE (
+    id UUID, slug VARCHAR, name VARCHAR, status VARCHAR, is_member BOOLEAN,
+    base_currency_id UUID, base_currency_code VARCHAR, base_currency_symbol VARCHAR, base_currency_decimals SMALLINT,
+    timezone VARCHAR
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = fintrace, pg_temp
+AS $$
+    SELECT t.id, t.slug, t.name, t.status, (m.id IS NOT NULL) AS is_member,
+           c.id, c.code, c.symbol, c.decimal_places, t.timezone
+      FROM fintrace.tenants t
+      JOIN fintrace.currencies c ON c.id = t.base_currency_id
+      LEFT JOIN fintrace.tenant_memberships m
+             ON m.tenant_id = t.id
+            AND m.user_id = p_user_id
+            AND m.status = 'ACTIVE'
+     WHERE t.status = 'ACTIVE'
+       AND EXISTS (SELECT 1 FROM fintrace.users u WHERE u.id = p_user_id AND u.status = 'ACTIVE')
+       AND (m.id IS NOT NULL OR COALESCE(p_platform_admin, FALSE))
+     ORDER BY (m.id IS NOT NULL) DESC, t.name, t.id;
+$$;
+
+REVOKE ALL ON FUNCTION fintrace.list_user_tenants(UUID, BOOLEAN) FROM PUBLIC;
+
+-- -----------------------------------------------------------------------------
+-- Row-level security: evaluate the permission once per statement, not per row
+-- -----------------------------------------------------------------------------
+-- A policy that calls fintrace.has_permission(...) directly runs it for every
+-- candidate row. Wrapping the call in a scalar sub-select makes PostgreSQL
+-- compute it once per statement (an InitPlan) and reuse the result. The check
+-- itself is unchanged: same function, same arguments, same STABLE snapshot.
+DO $$
+DECLARE
+    p RECORD;
+    v_using TEXT;
+    v_check TEXT;
+    v_sql TEXT;
+BEGIN
+    FOR p IN
+        SELECT schemaname, tablename, policyname, qual, with_check
+          FROM pg_policies
+         WHERE schemaname = 'fintrace'
+           AND (qual ~ 'has_permission\(' OR with_check ~ 'has_permission\(')
+    LOOP
+        -- Already wrapped (this block is safe to run again).
+        CONTINUE WHEN COALESCE(p.qual, '') ~ 'SELECT (fintrace\.)?has_permission\('
+                   OR COALESCE(p.with_check, '') ~ 'SELECT (fintrace\.)?has_permission\(';
+
+        v_using := regexp_replace(p.qual, '(fintrace\.)?has_permission\(([^()]*)\)', '(SELECT fintrace.has_permission(\2))', 'g');
+        v_check := regexp_replace(p.with_check, '(fintrace\.)?has_permission\(([^()]*)\)', '(SELECT fintrace.has_permission(\2))', 'g');
+
+        v_sql := format('ALTER POLICY %I ON %I.%I', p.policyname, p.schemaname, p.tablename);
+        IF v_using IS NOT NULL THEN
+            v_sql := v_sql || format(' USING (%s)', v_using);
+        END IF;
+        IF v_check IS NOT NULL THEN
+            v_sql := v_sql || format(' WITH CHECK (%s)', v_check);
+        END IF;
+        EXECUTE v_sql;
+    END LOOP;
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
+-- Broker connections (Zerodha Kite / Coin): read-only portfolio snapshots
+-- -----------------------------------------------------------------------------
+-- What a broker reports is kept apart from the ledger: it is the broker's view of
+-- holdings at market prices, refreshed on demand, and never posts ledger entries.
+CREATE TABLE IF NOT EXISTS fintrace.broker_connections (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    provider VARCHAR(20) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'CONNECTED',
+    broker_user_id VARCHAR(50) NOT NULL DEFAULT '',
+    broker_user_name VARCHAR(255) NOT NULL DEFAULT '',
+    -- Encrypted by the application; never returned by the API.
+    access_token_encrypted TEXT NULL,
+    token_expires_at TIMESTAMPTZ NULL,
+    connected_by UUID NOT NULL,
+    connected_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    last_synced_at TIMESTAMPTZ NULL,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT broker_connections_tenant_id_uk UNIQUE (tenant_id, id),
+    CONSTRAINT broker_connections_tenant_provider_uk UNIQUE (tenant_id, provider),
+    CONSTRAINT broker_connections_tenant_fk FOREIGN KEY (tenant_id) REFERENCES fintrace.tenants(id) ON DELETE RESTRICT,
+    CONSTRAINT broker_connections_user_fk FOREIGN KEY (connected_by) REFERENCES fintrace.users(id) ON DELETE RESTRICT,
+    CONSTRAINT broker_connections_provider_ck CHECK (provider IN ('ZERODHA')),
+    CONSTRAINT broker_connections_status_ck CHECK (status IN ('CONNECTED','EXPIRED','DISCONNECTED','SAMPLE')),
+    CONSTRAINT broker_connections_token_ck CHECK (status = 'CONNECTED' OR access_token_encrypted IS NULL)
+);
+
+CREATE TABLE IF NOT EXISTS fintrace.broker_holdings (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    connection_id UUID NOT NULL,
+    asset_class VARCHAR(20) NOT NULL,
+    symbol VARCHAR(100) NOT NULL,
+    name VARCHAR(255) NOT NULL DEFAULT '',
+    exchange VARCHAR(20) NOT NULL DEFAULT '',
+    isin VARCHAR(20) NOT NULL DEFAULT '',
+    folio VARCHAR(50) NOT NULL DEFAULT '',
+    quantity NUMERIC(24,6) NOT NULL,
+    average_price NUMERIC(19,6) NOT NULL,
+    last_price NUMERIC(19,6) NOT NULL,
+    close_price NUMERIC(19,6) NULL,
+    invested_value NUMERIC(19,2) NOT NULL,
+    current_value NUMERIC(19,2) NOT NULL,
+    pnl NUMERIC(19,2) NOT NULL,
+    day_change NUMERIC(19,2) NULL,
+    synced_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT broker_holdings_connection_fk FOREIGN KEY (tenant_id, connection_id)
+        REFERENCES fintrace.broker_connections(tenant_id, id) ON DELETE CASCADE,
+    CONSTRAINT broker_holdings_class_ck CHECK (asset_class IN ('EQUITY','MUTUAL_FUND')),
+    CONSTRAINT broker_holdings_quantity_ck CHECK (quantity > 0)
+);
+
+CREATE INDEX IF NOT EXISTS broker_holdings_connection_idx
+    ON fintrace.broker_holdings(tenant_id, connection_id, asset_class);
+
+CREATE TABLE IF NOT EXISTS fintrace.broker_portfolio_snapshots (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    connection_id UUID NOT NULL,
+    snapshot_date DATE NOT NULL,
+    invested_value NUMERIC(19,2) NOT NULL,
+    current_value NUMERIC(19,2) NOT NULL,
+    equity_value NUMERIC(19,2) NOT NULL DEFAULT 0,
+    mutual_fund_value NUMERIC(19,2) NOT NULL DEFAULT 0,
+    holding_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT broker_snapshots_connection_fk FOREIGN KEY (tenant_id, connection_id)
+        REFERENCES fintrace.broker_connections(tenant_id, id) ON DELETE CASCADE,
+    CONSTRAINT broker_snapshots_day_uk UNIQUE (tenant_id, connection_id, snapshot_date)
+);
+
+DROP TRIGGER IF EXISTS broker_connections_updated_at ON fintrace.broker_connections;
+CREATE TRIGGER broker_connections_updated_at BEFORE UPDATE ON fintrace.broker_connections
+FOR EACH ROW EXECUTE FUNCTION fintrace.set_updated_at();
+
+ALTER TABLE fintrace.broker_connections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fintrace.broker_holdings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fintrace.broker_portfolio_snapshots ENABLE ROW LEVEL SECURITY;
+
+DO $$
+DECLARE
+    t TEXT;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['broker_connections','broker_holdings','broker_portfolio_snapshots'] LOOP
+        EXECUTE format('DROP POLICY IF EXISTS %I ON fintrace.%I', t || '_select', t);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON fintrace.%I', t || '_write', t);
+        EXECUTE format(
+            'CREATE POLICY %I ON fintrace.%I FOR SELECT USING (tenant_id = fintrace.current_tenant_id() AND (SELECT fintrace.has_permission(''investments.view'')))',
+            t || '_select', t);
+        EXECUTE format(
+            'CREATE POLICY %I ON fintrace.%I FOR ALL USING (tenant_id = fintrace.current_tenant_id() AND (SELECT fintrace.has_permission(''investments.update''))) WITH CHECK (tenant_id = fintrace.current_tenant_id() AND (SELECT fintrace.has_permission(''investments.update'')))',
+            t || '_write', t);
+    END LOOP;
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
+-- Broker analytics: cash, SIPs, open positions and per-holding history
+-- -----------------------------------------------------------------------------
+ALTER TABLE fintrace.broker_connections
+    ADD COLUMN IF NOT EXISTS cash_available NUMERIC(19,2) NULL;
+
+CREATE TABLE IF NOT EXISTS fintrace.broker_positions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    connection_id UUID NOT NULL,
+    symbol VARCHAR(100) NOT NULL,
+    exchange VARCHAR(20) NOT NULL DEFAULT '',
+    product VARCHAR(20) NOT NULL DEFAULT '',
+    quantity NUMERIC(24,6) NOT NULL,
+    average_price NUMERIC(19,6) NOT NULL DEFAULT 0,
+    last_price NUMERIC(19,6) NOT NULL DEFAULT 0,
+    pnl NUMERIC(19,2) NOT NULL DEFAULT 0,
+    synced_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT broker_positions_connection_fk FOREIGN KEY (tenant_id, connection_id)
+        REFERENCES fintrace.broker_connections(tenant_id, id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS fintrace.broker_sips (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    connection_id UUID NOT NULL,
+    sip_id VARCHAR(50) NOT NULL DEFAULT '',
+    fund VARCHAR(255) NOT NULL DEFAULT '',
+    symbol VARCHAR(100) NOT NULL DEFAULT '',
+    status VARCHAR(20) NOT NULL DEFAULT '',
+    frequency VARCHAR(20) NOT NULL DEFAULT '',
+    instalment_amount NUMERIC(19,2) NOT NULL DEFAULT 0,
+    instalment_day INTEGER NULL,
+    next_instalment DATE NULL,
+    completed_instalments INTEGER NOT NULL DEFAULT 0,
+    -- -1 means the SIP runs until cancelled
+    pending_instalments INTEGER NOT NULL DEFAULT -1,
+    synced_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT broker_sips_connection_fk FOREIGN KEY (tenant_id, connection_id)
+        REFERENCES fintrace.broker_connections(tenant_id, id) ON DELETE CASCADE
+);
+
+-- One row per holding per day synced, so each holding's value can be followed over time.
+CREATE TABLE IF NOT EXISTS fintrace.broker_holding_snapshots (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    connection_id UUID NOT NULL,
+    snapshot_date DATE NOT NULL,
+    asset_class VARCHAR(20) NOT NULL,
+    symbol VARCHAR(100) NOT NULL,
+    folio VARCHAR(50) NOT NULL DEFAULT '',
+    quantity NUMERIC(24,6) NOT NULL,
+    invested_value NUMERIC(19,2) NOT NULL,
+    current_value NUMERIC(19,2) NOT NULL,
+    CONSTRAINT broker_holding_snapshots_connection_fk FOREIGN KEY (tenant_id, connection_id)
+        REFERENCES fintrace.broker_connections(tenant_id, id) ON DELETE CASCADE,
+    CONSTRAINT broker_holding_snapshots_day_uk UNIQUE (tenant_id, connection_id, snapshot_date, asset_class, symbol, folio)
+);
+
+CREATE INDEX IF NOT EXISTS broker_positions_connection_idx ON fintrace.broker_positions(tenant_id, connection_id);
+CREATE INDEX IF NOT EXISTS broker_sips_connection_idx ON fintrace.broker_sips(tenant_id, connection_id);
+
+ALTER TABLE fintrace.broker_positions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fintrace.broker_sips ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fintrace.broker_holding_snapshots ENABLE ROW LEVEL SECURITY;
+
+DO $$
+DECLARE
+    t TEXT;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['broker_positions','broker_sips','broker_holding_snapshots'] LOOP
+        EXECUTE format('DROP POLICY IF EXISTS %I ON fintrace.%I', t || '_select', t);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON fintrace.%I', t || '_write', t);
+        EXECUTE format(
+            'CREATE POLICY %I ON fintrace.%I FOR SELECT USING (tenant_id = fintrace.current_tenant_id() AND (SELECT fintrace.has_permission(''investments.view'')))',
+            t || '_select', t);
+        EXECUTE format(
+            'CREATE POLICY %I ON fintrace.%I FOR ALL USING (tenant_id = fintrace.current_tenant_id() AND (SELECT fintrace.has_permission(''investments.update''))) WITH CHECK (tenant_id = fintrace.current_tenant_id() AND (SELECT fintrace.has_permission(''investments.update'')))',
+            t || '_write', t);
+    END LOOP;
+END;
+$$;
 
 COMMIT;

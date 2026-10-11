@@ -1,5 +1,12 @@
 # Recurring Income and Expense Execution Design
 
+> **Status (superseded):** recurring income and expenses are now executable without
+> the extra columns proposed below. The counterpart is the workspace's
+> system-managed "Income" / "Expenses" account (found or created once per
+> currency), and the item's category is required at posting time. See
+> `FinancialFlows.run_recurring` and `POST /recurring-transactions/{id}/run/`.
+> The proposal is kept for context.
+
 The current schema can safely execute recurring `TRANSFER` rows because both accounting sides are explicit: `source_account_id` and `destination_account_id`.
 
 Recurring `INCOME` and `EXPENSE` should remain fail-closed until the schema stores enough account information to construct both ledger entries without guessing.

@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from uuid import UUID
 
 from FinTrace.apps.core.application.dto import (
@@ -10,6 +10,7 @@ from FinTrace.apps.core.application.dto import (
 )
 from FinTrace.apps.core.application.repository_interfaces import CurrencyRepository, FinancialMetadataRepository, LedgerRepository
 from FinTrace.apps.core.domain.entities import Currency
+from FinTrace.apps.core.domain.exceptions import Conflict
 from FinTrace.apps.core.infrastructure.database import context as db_context
 from FinTrace.apps.core.infrastructure.repositories import ReportingRepository, TenantResourceRepository
 
@@ -71,6 +72,15 @@ class LedgerService(TenantAwareService):
         with self._tx(context):
             self.ledger_repository.cancel_transaction(transaction_id)
 
+    def create_transfer(self, context: TenantContextDTO, occurred_at, source_account_id: UUID, destination_account_id: UUID, amount: Decimal, reference: str = "", description: str = "", exchange_rate: Decimal = Decimal("1")) -> UUID:
+        """Move money between two accounts as one posted, balanced transaction."""
+        with self._tx(context):
+            transaction_id = self.ledger_repository.create_transaction(occurred_at, reference, description)
+            self.ledger_repository.add_entry(transaction_id, destination_account_id, amount, Decimal("0"), exchange_rate)
+            self.ledger_repository.add_entry(transaction_id, source_account_id, Decimal("0"), amount, exchange_rate)
+            self.ledger_repository.post_transaction(transaction_id)
+            return transaction_id
+
     def reverse_transaction(self, context: TenantContextDTO, transaction_id: UUID, occurred_at, reference: str = "") -> UUID:
         with self._tx(context):
             return self.ledger_repository.reverse_transaction(context.tenant_id, transaction_id, occurred_at, reference)
@@ -114,14 +124,15 @@ class IncomeService(TenantAwareService):
         with self._tx(context):
             return self.metadata_repository.get_income(income_id)
 
-    def create_income(self, context: TenantContextDTO, dto: CreateIncomeDTO) -> UUID:
+    def create_income(self, context: TenantContextDTO, dto: CreateIncomeDTO, description: str | None = None) -> tuple[UUID, UUID]:
+        """Post the income to the ledger and attach its record. Returns (ledger transaction id, income id)."""
         with self._tx(context):
-            transaction_id = self.ledger_repository.create_transaction(dto.occurred_at, dto.reference, dto.notes)
-            self.ledger_repository.add_entry(transaction_id, dto.destination_account_id, dto.amount, Decimal("0"))
-            self.ledger_repository.add_entry(transaction_id, dto.income_account_id, Decimal("0"), dto.amount)
+            transaction_id = self.ledger_repository.create_transaction(dto.occurred_at, dto.reference, description or dto.notes)
+            self.ledger_repository.add_entry(transaction_id, dto.destination_account_id, dto.amount, Decimal("0"), dto.exchange_rate)
+            self.ledger_repository.add_entry(transaction_id, dto.income_account_id, Decimal("0"), dto.amount, dto.exchange_rate)
             self.ledger_repository.post_transaction(transaction_id)
-            self.metadata_repository.create_income(context.tenant_id, transaction_id, dto.category_id, dto.contact_id, dto.amount, dto.currency_id, dto.occurred_on, dto.notes)
-            return transaction_id
+            income_id = self.metadata_repository.create_income(context.tenant_id, transaction_id, dto.category_id, dto.contact_id, dto.amount, dto.currency_id, dto.occurred_on, dto.notes)
+            return transaction_id, income_id
 
 
 class ExpenseService(TenantAwareService):
@@ -137,14 +148,15 @@ class ExpenseService(TenantAwareService):
         with self._tx(context):
             return self.metadata_repository.get_expense(expense_id)
 
-    def create_expense(self, context: TenantContextDTO, dto: CreateExpenseDTO) -> UUID:
+    def create_expense(self, context: TenantContextDTO, dto: CreateExpenseDTO, description: str | None = None) -> tuple[UUID, UUID]:
+        """Post the expense to the ledger and attach its record. Returns (ledger transaction id, expense id)."""
         with self._tx(context):
-            transaction_id = self.ledger_repository.create_transaction(dto.occurred_at, dto.reference, dto.notes)
-            self.ledger_repository.add_entry(transaction_id, dto.expense_account_id, dto.amount, Decimal("0"))
-            self.ledger_repository.add_entry(transaction_id, dto.source_account_id, Decimal("0"), dto.amount)
+            transaction_id = self.ledger_repository.create_transaction(dto.occurred_at, dto.reference, description or dto.notes)
+            self.ledger_repository.add_entry(transaction_id, dto.expense_account_id, dto.amount, Decimal("0"), dto.exchange_rate)
+            self.ledger_repository.add_entry(transaction_id, dto.source_account_id, Decimal("0"), dto.amount, dto.exchange_rate)
             self.ledger_repository.post_transaction(transaction_id)
-            self.metadata_repository.create_expense(context.tenant_id, transaction_id, dto.category_id, dto.contact_id, dto.amount, dto.currency_id, dto.occurred_on, dto.notes)
-            return transaction_id
+            expense_id = self.metadata_repository.create_expense(context.tenant_id, transaction_id, dto.category_id, dto.contact_id, dto.amount, dto.currency_id, dto.occurred_on, dto.notes)
+            return transaction_id, expense_id
 
 
 class DebtService(TenantAwareService):
@@ -152,20 +164,37 @@ class DebtService(TenantAwareService):
         self.ledger_repository = ledger_repository
         self.metadata_repository = metadata_repository
 
-    def create_repayment(self, context: TenantContextDTO, dto: CreateDebtRepaymentDTO) -> UUID:
+    def create_repayment(self, context: TenantContextDTO, dto: CreateDebtRepaymentDTO) -> tuple[UUID, UUID]:
+        """Post a repayment. Returns (ledger transaction id, repayment id).
+
+        PAYABLE (money we owe): debit the liability and interest expense, credit cash.
+        RECEIVABLE (money owed to us): debit cash, credit the receivable and interest income.
+        """
         total = dto.principal_amount + dto.interest_amount
+        interest_account_id = dto.interest_account_id or dto.interest_expense_account_id
+        if dto.interest_amount > 0 and interest_account_id is None:
+            raise ValueError("interest_expense_account_id is required when interest_amount is positive")
+        payable = dto.debt_type != "RECEIVABLE"
+        zero = Decimal("0")
         with self._tx(context):
             transaction_id = self.ledger_repository.create_transaction(dto.occurred_at, dto.reference, dto.notes)
-            if dto.principal_amount > 0:
-                self.ledger_repository.add_entry(transaction_id, dto.liability_account_id, dto.principal_amount, Decimal("0"))
-            if dto.interest_amount > 0:
-                if dto.interest_expense_account_id is None:
-                    raise ValueError("interest_expense_account_id is required when interest_amount is positive")
-                self.ledger_repository.add_entry(transaction_id, dto.interest_expense_account_id, dto.interest_amount, Decimal("0"))
-            self.ledger_repository.add_entry(transaction_id, dto.cash_account_id, Decimal("0"), total)
+            if payable:
+                if dto.principal_amount > 0:
+                    self.ledger_repository.add_entry(transaction_id, dto.liability_account_id, dto.principal_amount, zero, dto.exchange_rate)
+                if dto.interest_amount > 0:
+                    self.ledger_repository.add_entry(transaction_id, interest_account_id, dto.interest_amount, zero, dto.exchange_rate)
+                self.ledger_repository.add_entry(transaction_id, dto.cash_account_id, zero, total, dto.exchange_rate)
+            else:
+                self.ledger_repository.add_entry(transaction_id, dto.cash_account_id, total, zero, dto.exchange_rate)
+                if dto.principal_amount > 0:
+                    self.ledger_repository.add_entry(transaction_id, dto.liability_account_id, zero, dto.principal_amount, dto.exchange_rate)
+                if dto.interest_amount > 0:
+                    self.ledger_repository.add_entry(transaction_id, interest_account_id, zero, dto.interest_amount, dto.exchange_rate)
             self.ledger_repository.post_transaction(transaction_id)
-            self.metadata_repository.create_debt_repayment(context.tenant_id, dto.debt_id, transaction_id, dto.principal_amount, dto.interest_amount, dto.repaid_on, dto.notes)
-            return transaction_id
+            repayment_id = self.metadata_repository.create_debt_repayment(context.tenant_id, dto.debt_id, transaction_id, dto.principal_amount, dto.interest_amount, dto.repaid_on, dto.notes)
+            if dto.settles_debt:
+                self.metadata_repository.mark_debt_paid(dto.debt_id)
+            return transaction_id, repayment_id
 
 
 class ReportingService(TenantAwareService):
@@ -278,47 +307,76 @@ class InvestmentService(TenantAwareService):
         self.ledger_repository = ledger_repository
         self.investment_repository = investment_repository
 
-    def create_trade(self, context: TenantContextDTO, payload: dict) -> UUID:
+    def create_trade(self, context: TenantContextDTO, payload: dict) -> tuple[UUID, UUID]:
+        """Post a fully resolved trade. Returns (trade id, ledger transaction id).
+
+        Amounts are rounded to the currency's precision exactly as the database
+        validation does, so the posting and the stored trade always agree.
+        """
         quantity = Decimal(str(payload["quantity"]))
         price = Decimal(str(payload["price"]))
         fees = Decimal(str(payload.get("fees", "0")))
-        gross = quantity * price
+        rate = Decimal(str(payload.get("exchange_rate", "1")))
+        decimals = payload.get("decimals")
         trade_type = payload["trade_type"].upper()
+        zero = Decimal("0")
+
+        def money(value: Decimal) -> Decimal:
+            if decimals is None:
+                return value
+            return value.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_HALF_UP)
+
+        gross = money(quantity * price)
+        occurred_at = payload["occurred_at"]
+        if isinstance(occurred_at, str):
+            occurred_at = datetime.fromisoformat(occurred_at)
         with self._tx(context):
-            transaction_id = self.ledger_repository.create_transaction(datetime.fromisoformat(payload["occurred_at"]), payload.get("reference", ""), payload.get("notes", ""))
+            transaction_id = self.ledger_repository.create_transaction(occurred_at, payload.get("reference", ""), payload.get("notes", ""))
+            cash_account = UUID(payload["cash_account_id"])
+            investment_account = UUID(payload["investment_account_id"])
             if trade_type == "BUY":
-                cash = gross + fees
-                self.ledger_repository.add_entry(transaction_id, UUID(payload["investment_account_id"]), cash, Decimal("0"))
-                self.ledger_repository.add_entry(transaction_id, UUID(payload["cash_account_id"]), Decimal("0"), cash)
+                cash = money(gross + fees)
+                self.ledger_repository.add_entry(transaction_id, investment_account, cash, zero, rate)
+                self.ledger_repository.add_entry(transaction_id, cash_account, zero, cash, rate)
             elif trade_type == "SELL":
                 position = self.investment_repository.get_position(UUID(payload["portfolio_id"]), UUID(payload["instrument_id"]))
                 if position is None:
                     raise ValueError("Cannot sell without an existing investment position")
                 avg_cost = Decimal(str(position["average_cost"]))
-                cash = gross - fees
-                realized_pnl = (price - avg_cost) * quantity - fees
-                cost_basis = cash - realized_pnl
-                self.ledger_repository.add_entry(transaction_id, UUID(payload["cash_account_id"]), cash, Decimal("0"))
-                self.ledger_repository.add_entry(transaction_id, UUID(payload["investment_account_id"]), Decimal("0"), cost_basis)
-                pnl_account = UUID(payload["realized_pnl_account_id"])
-                if realized_pnl > 0:
-                    self.ledger_repository.add_entry(transaction_id, pnl_account, Decimal("0"), realized_pnl)
-                elif realized_pnl < 0:
-                    self.ledger_repository.add_entry(transaction_id, pnl_account, abs(realized_pnl), Decimal("0"))
+                cash = money(gross - fees)
+                # Mirrors apply_investment_trade_to_position: 8 dp, then the 4 dp column.
+                realized_pnl = ((price - avg_cost) * quantity - fees).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+                cost_basis = money(cash - realized_pnl)
+                pnl_entry = money(abs(realized_pnl))
+                self.ledger_repository.add_entry(transaction_id, cash_account, cash, zero, rate)
+                if cost_basis > 0:
+                    self.ledger_repository.add_entry(transaction_id, investment_account, zero, cost_basis, rate)
+                if pnl_entry > 0:
+                    if not payload.get("realized_pnl_account_id"):
+                        raise ValueError("realized_pnl_account_id is required when a sale has a gain or loss")
+                    pnl_account = UUID(payload["realized_pnl_account_id"])
+                    if realized_pnl > 0:
+                        self.ledger_repository.add_entry(transaction_id, pnl_account, zero, pnl_entry, rate)
+                    else:
+                        self.ledger_repository.add_entry(transaction_id, pnl_account, pnl_entry, zero, rate)
             else:
                 raise ValueError("trade_type must be BUY or SELL")
             self.ledger_repository.post_transaction(transaction_id)
-            payload = {**payload, "trade_type": trade_type}
-            return self.investment_repository.create_trade(context.tenant_id, payload, transaction_id)
+            payload = {**payload, "trade_type": trade_type, "traded_at": payload.get("traded_at") or occurred_at}
+            return self.investment_repository.create_trade(context.tenant_id, payload, transaction_id), transaction_id
 
-    def create_dividend(self, context: TenantContextDTO, payload: dict) -> UUID:
+    def create_dividend(self, context: TenantContextDTO, payload: dict) -> tuple[UUID, UUID]:
         amount = Decimal(str(payload["amount"]))
+        rate = Decimal(str(payload.get("exchange_rate", "1")))
+        occurred_at = payload["occurred_at"]
+        if isinstance(occurred_at, str):
+            occurred_at = datetime.fromisoformat(occurred_at)
         with self._tx(context):
-            transaction_id = self.ledger_repository.create_transaction(datetime.fromisoformat(payload["occurred_at"]), payload.get("reference", ""), payload.get("notes", ""))
-            self.ledger_repository.add_entry(transaction_id, UUID(payload["cash_account_id"]), amount, Decimal("0"))
-            self.ledger_repository.add_entry(transaction_id, UUID(payload["income_account_id"]), Decimal("0"), amount)
+            transaction_id = self.ledger_repository.create_transaction(occurred_at, payload.get("reference", ""), payload.get("notes", ""))
+            self.ledger_repository.add_entry(transaction_id, UUID(payload["cash_account_id"]), amount, Decimal("0"), rate)
+            self.ledger_repository.add_entry(transaction_id, UUID(payload["income_account_id"]), Decimal("0"), amount, rate)
             self.ledger_repository.post_transaction(transaction_id)
-            return self.investment_repository.create_dividend(context.tenant_id, payload, transaction_id)
+            return self.investment_repository.create_dividend(context.tenant_id, payload, transaction_id), transaction_id
 
 
 class AssetService(TenantAwareService):
@@ -378,21 +436,30 @@ class IdempotencyService(TenantAwareService):
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
     def begin(self, context: TenantContextDTO, scope: str, key: str, payload: dict) -> dict:
-        with self._tx(context):
-            fingerprint = self.fingerprint(payload)
-            op = self.repository.begin(context.tenant_id, context.user_id, scope, key, fingerprint, datetime.now(UTC) + timedelta(hours=24))
-            if op["request_fingerprint"].lower() != fingerprint.lower():
-                raise ValueError("IDEMPOTENCY_PAYLOAD_MISMATCH")
-            if not op.get("is_new"):
-                if op["status"] == "COMPLETED":
-                    return {"reuse": True, "operation": op}
-                if op["status"] == "PROCESSING":
-                    raise ValueError("IDEMPOTENCY_OPERATION_PROCESSING")
-                if op["status"] == "FAILED":
-                    raise ValueError("IDEMPOTENCY_OPERATION_FAILED")
-                if op["status"] == "EXPIRED":
-                    raise ValueError("IDEMPOTENCY_KEY_EXPIRED")
+        """Claim an idempotency key inside the caller's transaction.
+
+        Call this, run the operation, then ``complete`` — all in one tenant
+        transaction. The claim, the financial posting and the stored response then
+        commit or roll back together, so a key can never be left half-done.
+        """
+        fingerprint = self.fingerprint(payload)
+        expires_at = datetime.now(UTC) + timedelta(hours=24)
+        op = self.repository.begin(context.tenant_id, context.user_id, scope, key, fingerprint, expires_at)
+        if op["request_fingerprint"].lower() != fingerprint.lower():
+            raise Conflict(
+                "This Idempotency-Key was already used for a different request.", code="IDEMPOTENCY_KEY_REUSED"
+            )
+        if op.get("is_new"):
             return {"reuse": False, "operation": op}
+        if op["status"] == "COMPLETED":
+            return {"reuse": True, "operation": op}
+        if op["status"] == "EXPIRED":
+            raise Conflict("This Idempotency-Key has expired. Submit again with a new key.", code="IDEMPOTENCY_KEY_EXPIRED")
+        # PROCESSING or FAILED rows that are visible here were committed by an
+        # attempt that did not finish. Nothing financial was committed with them
+        # (new attempts commit atomically), so the same request may run again.
+        self.repository.restart(op["id"], expires_at)
+        return {"reuse": False, "operation": op}
 
     def complete(self, context: TenantContextDTO, operation_id: UUID, business_operation_id: UUID | None, response_status: int, response_payload: dict) -> None:
         with self._tx(context):
@@ -414,33 +481,6 @@ class RecurringService(TenantAwareService):
     def list_occurrences(self, context: TenantContextDTO, limit: int, offset: int) -> list[dict]:
         with self._tx(context):
             return self.repository.list_occurrences(limit, offset)
-
-    def claim_due_occurrences(self, context: TenantContextDTO, batch_size: int) -> list[dict]:
-        with self._tx(context):
-            return self.repository.claim_due_occurrences(batch_size)
-
-    def process_due_occurrences(self, context: TenantContextDTO, batch_size: int) -> list[dict]:
-        if self.ledger_repository is None:
-            raise ValueError("Ledger repository is required for recurring execution")
-        results = []
-        with self._tx(context):
-            claimed = self.repository.claim_due_occurrences(batch_size)
-            for occurrence in claimed:
-                try:
-                    definition = self.repository.get_definition_for_occurrence(occurrence["id"])
-                    if definition["transaction_type"] != "TRANSFER":
-                        raise ValueError("Recurring INCOME/EXPENSE requires configured counterpart accounts before execution")
-                    tx_id = self.ledger_repository.create_transaction(datetime.combine(definition["scheduled_for"], datetime.min.time(), tzinfo=UTC), "", definition.get("description", ""))
-                    amount = Decimal(str(definition["amount"]))
-                    self.ledger_repository.add_entry(tx_id, definition["destination_account_id"], amount, Decimal("0"))
-                    self.ledger_repository.add_entry(tx_id, definition["source_account_id"], Decimal("0"), amount)
-                    self.ledger_repository.post_transaction(tx_id)
-                    self.repository.complete_occurrence(occurrence["id"], tx_id)
-                    results.append({"occurrence_id": occurrence["id"], "status": "COMPLETED", "ledger_transaction_id": tx_id})
-                except Exception as exc:
-                    self.repository.fail_occurrence(occurrence["id"], str(exc))
-                    results.append({"occurrence_id": occurrence["id"], "status": "FAILED", "failure_reason": str(exc)})
-            return results
 
 
 class TenantService(ResourceService):

@@ -10,6 +10,22 @@ def protect_database():
     if "integration" not in db_name and "test" not in db_name:
         pytest.exit(f"ABORT: Running integration tests against '{db_name}' is forbidden.")
 
+@pytest.fixture(scope="session", autouse=True)
+def never_flush_database():
+    """Transactional Django tests TRUNCATE every managed table on teardown.
+
+    This suite runs against a persistent database as the unprivileged runtime
+    role, which rightly cannot truncate anything. Tests create uniquely named
+    data instead of relying on a flush.
+    """
+    from django.test import TransactionTestCase
+
+    original = TransactionTestCase._fixture_teardown
+    TransactionTestCase._fixture_teardown = lambda self: None
+    yield
+    TransactionTestCase._fixture_teardown = original
+
+
 @pytest.fixture(scope="session")
 def django_db_setup(django_db_blocker):
     settings.DATABASES["default"]["NAME"] = os.environ.get("DATABASE_NAME", "fintrace_integration")
