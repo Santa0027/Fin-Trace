@@ -290,6 +290,55 @@ describe('zerodha analysis', () => {
     expect(within(card).getByText(/not included in net worth/i)).toBeInTheDocument();
     expect(within(screen.getByRole('region', { name: 'Net worth' })).getByText('$7,500.00')).toBeInTheDocument(); // unchanged by the broker figures
   });
+
+  it('toggles Zerodha portfolio inclusion in combined net worth', async () => {
+    const user = userEvent.setup();
+    const noop = () => undefined;
+    installApi({
+      'GET /dashboard/summary/': () => ({
+        body: summary({
+          totals: {
+            assets: '9000.00',
+            liabilities: '1500.00',
+            net_worth: '7500.00',
+            net_worth_with_broker: '32990.09',
+            assets_with_broker: '34490.09',
+            broker_current: '25490.09',
+            broker_invested: '22313.67',
+            income: '4000.00',
+            expenses: '1000.00',
+            net_cash_flow: '3000.00',
+            savings_rate: 75,
+          },
+          broker: {
+            provider: 'ZERODHA',
+            status: 'CONNECTED',
+            currency: 'INR',
+            last_synced_at: '2026-10-11T04:00:05Z',
+            holding_count: 2,
+            invested_value: '22313.67',
+            current_value: '25490.09',
+            pnl: '3176.42',
+            pnl_percent: 14.24,
+            day_change: '244.20',
+            day_change_percent: 1.36,
+          },
+        }),
+      }),
+    });
+    renderWithProviders(<DashboardPage setPage={noop} openExpense={noop} openIncome={noop} openChooser={noop} />);
+    const netWorthRegion = await screen.findByRole('region', { name: 'Net worth' });
+    expect(within(netWorthRegion).getByText('$7,500.00')).toBeInTheDocument();
+
+    const toggle = screen.getByRole('switch', { name: /include zerodha in net worth/i });
+    await user.click(toggle);
+
+    expect(within(netWorthRegion).getByText('$32,990.09')).toBeInTheDocument();
+    expect(within(netWorthRegion).getByText(/combined net worth/i)).toBeInTheDocument();
+
+    const brokerCard = screen.getByRole('region', { name: 'Zerodha portfolio' });
+    expect(within(brokerCard).getByText(/included in combined net worth/i)).toBeInTheDocument();
+  });
 });
 
 describe('investments', () => {

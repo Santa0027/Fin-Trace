@@ -656,12 +656,19 @@ class DashboardSummaryView(SafeView):
                 },
             }
         body = _read(context, build)
-        body["broker"] = _broker_headline(context)
+        broker = _broker_headline(context)
+        if broker and "current_value" in broker:
+            broker_current = Decimal(str(broker["current_value"]))
+            base_assets = Decimal(str(body["totals"]["assets"]))
+            base_net_worth = Decimal(str(body["totals"]["net_worth"]))
+            broker["combined_assets"] = _money(base_assets + broker_current)
+            broker["combined_net_worth"] = _money(base_net_worth + broker_current)
+        body["broker"] = broker
         return JsonResponse(body)
 
 
 def _broker_headline(context: TenantContextDTO) -> dict | None:
-    """The connected broker portfolio at a glance. Reference only: it is not part of net worth."""
+    """The connected broker portfolio at a glance."""
     from FinTrace.apps.core.application.broker import BrokerService
 
     try:

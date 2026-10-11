@@ -154,7 +154,23 @@ export function ReportsPage() {
             <div className="card" style={{ padding: '20px' }}>
               <div style={{ display: 'flex', gap: '40px', flexWrap: 'wrap', marginBottom: '16px' }}>
                 <div><span className="eyebrow">Net worth</span><strong className="mono" style={{ display: 'block', fontSize: '24px' }}>{formatMoney(data.totals.net_worth)}</strong></div>
+                {data.broker && toNumber(data.broker.current_value) > 0 && (
+                  <div>
+                    <span className="eyebrow">Combined (+ Zerodha)</span>
+                    <strong className="mono" style={{ display: 'block', fontSize: '24px', color: 'var(--primary)' }}>
+                      {formatMoney(data.totals.net_worth_with_broker || (toNumber(data.totals.net_worth) + toNumber(data.broker.current_value)).toFixed(2))}
+                    </strong>
+                  </div>
+                )}
                 <div><span className="eyebrow">What you have</span><strong className="mono" style={{ display: 'block', fontSize: '18px' }}>{formatMoney(data.totals.assets)}</strong></div>
+                {data.broker && toNumber(data.broker.current_value) > 0 && (
+                  <div>
+                    <span className="eyebrow">Zerodha portfolio</span>
+                    <strong className="mono" style={{ display: 'block', fontSize: '18px' }}>
+                      {formatMoney(data.broker.current_value, data.broker.currency)}
+                    </strong>
+                  </div>
+                )}
                 <div><span className="eyebrow">What you owe</span><strong className="mono" style={{ display: 'block', fontSize: '18px' }}>{formatMoney(data.totals.liabilities)}</strong></div>
               </div>
               {[['What you have', assets] as const, ['What you owe', liabilities] as const].map(([title, list]) => (

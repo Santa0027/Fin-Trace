@@ -325,10 +325,12 @@ def test_analysis_concentration_periods_sips_and_cash(fresh, kite, admin_connect
     texts = " ".join(note["text"] for note in analysis["insights"])
     assert "2 active SIPs invest about ₹7,166.67 a month" in texts and "is sitting uninvested" in texts and "market movement has gained ₹958.30" in texts
 
-    # The main dashboard carries the headline, separately from net worth.
+    # The main dashboard carries the headline and provides combined net worth alongside ledger net worth.
     summary = fresh.summary()
     assert Decimal(summary["broker"]["current_value"]) == Decimal("48958.39") and summary["broker"]["status"] == "CONNECTED"
     assert Decimal(summary["totals"]["net_worth"]) == 0
+    assert Decimal(summary["broker"]["combined_net_worth"]) == Decimal("48958.39")
+    assert Decimal(summary["broker"]["combined_assets"]) == Decimal("48958.39")
 
 
 def test_sync_still_succeeds_when_optional_data_is_refused(fresh, kite):

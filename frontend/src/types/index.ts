@@ -352,6 +352,14 @@ export interface DashboardSummary {
     assets: Money;
     liabilities: Money;
     net_worth: Money;
+    /** Combined net worth including connected broker market value. */
+    net_worth_with_broker?: Money;
+    /** Combined assets including connected broker market value. */
+    assets_with_broker?: Money;
+    /** Current market value of connected broker holdings. */
+    broker_current?: Money;
+    /** Invested cost basis of connected broker holdings. */
+    broker_invested?: Money;
     income: Money;
     expenses: Money;
     net_cash_flow: Money;
@@ -365,7 +373,7 @@ export interface DashboardSummary {
   recent_transactions: Transaction[];
   debts: { payable: Money; receivable: Money; active_count: number };
   investments: { cost_basis: Money; holding_count: number };
-  /** Connected broker portfolio at a glance. Shown for reference; never part of net worth. */
+  /** Connected broker portfolio at a glance. */
   broker: BrokerHeadline | null;
 }
 
@@ -381,6 +389,8 @@ export interface BrokerHeadline {
   pnl_percent: number | null;
   day_change: Money | null;
   day_change_percent: number | null;
+  combined_assets?: Money;
+  combined_net_worth?: Money;
 }
 
 export interface PermissionRow {

@@ -69,6 +69,7 @@ export function DashboardPage({ setPage, openExpense, openIncome, openChooser }:
   const { canCreateIncome, canCreateExpenses, canTransfer } = useFinancialPermissions();
   const [preset, setPreset] = useState<PeriodPreset>('THIS_MONTH');
   const [selected, setSelected] = useState<Transaction | null>(null);
+  const [includeBroker, setIncludeBroker] = useState<boolean>(false);
 
   const period = useMemo(() => periodFor(preset), [preset]);
   const { data, loading, error, forbidden, reload } = useTenantQuery(
@@ -124,6 +125,9 @@ export function DashboardPage({ setPage, openExpense, openIncome, openChooser }:
   const isNew = data.accounts.length === 0 && data.recent_transactions.length === 0;
   const notes = observations(data);
   const periodLabel = `${formatDate(data.period.date_from)} – ${formatDate(data.period.date_to)}`;
+  const hasBroker = Boolean(data.broker && toNumber(data.broker.current_value) > 0);
+  const activeNetWorth = includeBroker && hasBroker ? (data.broker?.combined_net_worth || totals.net_worth_with_broker || (toNumber(totals.net_worth) + toNumber(data.broker!.current_value)).toFixed(2)) : totals.net_worth;
+  const activeAssets = includeBroker && hasBroker ? (data.broker?.combined_assets || totals.assets_with_broker || (toNumber(totals.assets) + toNumber(data.broker!.current_value)).toFixed(2)) : totals.assets;
 
   return (
     <>
@@ -140,16 +144,56 @@ export function DashboardPage({ setPage, openExpense, openIncome, openChooser }:
         />
       ) : (
         <>
-          <section className="card" aria-label="Net worth" style={{ padding: '20px 24px', marginBottom: '14px', display: 'flex', gap: '40px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
-            <div>
-              <span className="eyebrow">Net worth today</span>
-              <strong className="mono" style={{ fontSize: '34px', display: 'block', lineHeight: 1.1 }}>{formatMoney(totals.net_worth)}</strong>
-              <small style={{ color: 'var(--muted)' }}>What you have minus what you owe, in {data.currency.code}</small>
+          <section className="card" aria-label="Net worth" style={{ padding: '20px 24px', marginBottom: '14px', display: 'flex', gap: '32px', flexWrap: 'wrap', alignItems: 'flex-end', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', gap: '32px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+              <div>
+                <span className="eyebrow">{includeBroker && hasBroker ? 'Combined net worth' : 'Net worth today'}</span>
+                <strong className="mono" style={{ fontSize: '34px', display: 'block', lineHeight: 1.1 }}>{formatMoney(activeNetWorth)}</strong>
+                <small style={{ color: 'var(--muted)' }}>
+                  {includeBroker && hasBroker
+                    ? `Includes ledger accounts and Zerodha (${formatMoney(data.broker!.current_value, data.broker!.currency)})`
+                    : `What you have minus what you owe, in ${data.currency.code}`}
+                </small>
+              </div>
+              <Figure label="What you have" value={formatMoney(activeAssets)} hint={includeBroker && hasBroker ? `${owned.length} account${owned.length === 1 ? '' : 's'} + Zerodha` : `${owned.length} account${owned.length === 1 ? '' : 's'}`} />
+              <Figure label="What you owe" value={formatMoney(totals.liabilities)} hint={toNumber(data.debts.payable) > 0 ? `incl. ${formatMoney(data.debts.payable)} in loans` : undefined} />
+              {hasBroker && (
+                <Figure
+                  label="Zerodha portfolio"
+                  value={formatMoney(data.broker!.current_value, data.broker!.currency)}
+                  hint={includeBroker ? `Included (${data.broker!.holding_count} holdings)` : `Toggle to include (${data.broker!.holding_count} holdings)`}
+                  tone={toNumber(data.broker!.pnl) >= 0 ? 'good' : 'text-danger'}
+                />
+              )}
+              {data.investments.holding_count > 0 && (
+                <Figure label="Invested (at cost)" value={formatMoney(data.investments.cost_basis)} hint={`${data.investments.holding_count} holding${data.investments.holding_count === 1 ? '' : 's'}`} />
+              )}
             </div>
-            <Figure label="What you have" value={formatMoney(totals.assets)} hint={`${owned.length} account${owned.length === 1 ? '' : 's'}`} />
-            <Figure label="What you owe" value={formatMoney(totals.liabilities)} hint={toNumber(data.debts.payable) > 0 ? `incl. ${formatMoney(data.debts.payable)} in loans` : undefined} />
-            {data.investments.holding_count > 0 && (
-              <Figure label="Invested (at cost)" value={formatMoney(data.investments.cost_basis)} hint={`${data.investments.holding_count} holding${data.investments.holding_count === 1 ? '' : 's'}`} />
+            {hasBroker && (
+              <div style={{ alignSelf: 'flex-start', marginLeft: 'auto' }}>
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', padding: '4px 10px', borderRadius: '8px', background: 'var(--bg-subtle, rgba(0,0,0,0.03))', border: '1px solid var(--border)' }}>
+                  <span style={{ fontSize: '11px', color: 'var(--muted)', fontWeight: 600 }}>Zerodha in Net Worth:</span>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={includeBroker}
+                    aria-label="Include Zerodha in net worth"
+                    onClick={() => setIncludeBroker(!includeBroker)}
+                    style={{
+                      padding: '3px 8px',
+                      fontSize: '11px',
+                      borderRadius: '6px',
+                      border: 'none',
+                      background: includeBroker ? 'var(--primary)' : 'var(--border)',
+                      color: includeBroker ? '#fff' : 'inherit',
+                      cursor: 'pointer',
+                      fontWeight: 600,
+                    }}
+                  >
+                    {includeBroker ? 'Included' : 'Off'}
+                  </button>
+                </div>
+              </div>
             )}
           </section>
 
@@ -198,7 +242,11 @@ export function DashboardPage({ setPage, openExpense, openIncome, openChooser }:
               </div>
               <div style={{ textAlign: 'right' }}>
                 <Button kind="ghost" onClick={() => setPage('Investments')}>Open portfolio</Button>
-                <small style={{ display: 'block', color: 'var(--muted)', maxWidth: '220px' }}>Shown for reference. Not included in net worth above.</small>
+                <small style={{ display: 'block', color: 'var(--muted)', maxWidth: '220px' }}>
+                  {includeBroker
+                    ? 'Included in Combined Net Worth above.'
+                    : 'Shown for reference. Not included in net worth above.'}
+                </small>
               </div>
             </section>
           )}
